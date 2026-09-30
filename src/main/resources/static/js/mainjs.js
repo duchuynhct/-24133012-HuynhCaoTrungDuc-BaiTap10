@@ -15,7 +15,12 @@ $(document).ready(function() {
             // $('#profile').html(json);
             $('#profile').html('Xin chào: ' + data.fullName + ' (' + data.email + ')');
             if (data.images) {
-                $('#images').attr('src', data.images).show();
+                var imgSrc = data.images.startsWith("http") || data.images.startsWith("/")
+                    ? data.images
+                    : "/images/" + data.images;
+                $('#images').attr('src', imgSrc).on('error', function() {
+                    $(this).hide();
+                }).show();
             }
             // console.log("SUCCESS : ", data);
         },
