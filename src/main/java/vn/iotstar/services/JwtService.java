@@ -1,21 +1,33 @@
 package vn.iotstar.services;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
+import com.nimbusds.jose.JOSEException;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.JWSSigner;
+import com.nimbusds.jose.JWSVerifier;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jose.crypto.MACVerifier;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.security.SignatureException;
+import java.text.ParseException;
+import java.util.Base64;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 
+/**
+ * Service xử lý JSON Web Token sử dụng thư viện Nimbus JOSE + JWT (com.nimbusds:nimbus-jose-jwt)
+ */
 @Service
 public class JwtService {
+
     @Value("${security.jwt.secret-key}")
     private String secretKey;
 
@@ -23,11 +35,11 @@ public class JwtService {
     private long jwtExpiration;
 
     public String extractUsername(String token) {
-        return extractClaim(token, Claims::getSubject);
+        return extractClaim(token, JWTClaimsSet::getSubject);
     }
 
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        final Claims claims = extractAllClaims(token);
+    public <T> T extractClaim(String token, Function<JWTClaimsSet, T> claimsResolver) {
+        final JWTClaimsSet claims = extractAllClaims(token);
         return claimsResolver.apply(claims);
     }
 
@@ -48,39 +60,84 @@ public class JwtService {
             UserDetails userDetails,
             long expiration
     ) {
-        return Jwts.builder()
-                .claims(extraClaims)
-                .subject(userDetails.getUsername())
-                .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + expiration))
-                .signWith(getSignInKey(), Jwts.SIG.HS256)
-                .compact();
+        try {
+            Date issueTime = new Date(System.currentTimeMillis());
+            Date expirationTime = new Date(System.currentTimeMillis() + expiration);
+
+            JWTClaimsSet.Builder claimsBuilder = new JWTClaimsSet.Builder()
+                    .subject(userDetails.getUsername())
+                    .issueTime(issueTime)
+                    .expirationTime(expirationTime);
+
+            if (extraClaims != null) {
+                for (Map.Entry<String, Object> entry : extraClaims.entrySet()) {
+                    claimsBuilder.claim(entry.getKey(), entry.getValue());
+                }
+            }
+
+            JWTClaimsSet claimsSet = claimsBuilder.build();
+
+            // Khởi tạo JWS Header với thuật toán HMAC-SHA256 (HS256)
+            JWSHeader header = new JWSHeader(JWSAlgorithm.HS256);
+            SignedJWT signedJWT = new SignedJWT(header, claimsSet);
+
+            // Ký token với MACSigner và secret key
+            JWSSigner signer = new MACSigner(getSigningKeyBytes());
+            signedJWT.sign(signer);
+
+            return signedJWT.serialize();
+        } catch (JOSEException e) {
+            throw new RuntimeException("Lỗi khi ký JWT bằng Nimbus: " + e.getMessage(), e);
+        }
     }
 
     public boolean isTokenValid(String token, UserDetails userDetails) {
         final String username = extractUsername(token);
-        return (username.equals(userDetails.getUsername())) && !isTokenExpired(token);
+        return (username != null && username.equals(userDetails.getUsername())) && !isTokenExpired(token);
     }
 
     private boolean isTokenExpired(String token) {
-        return extractExpiration(token).before(new Date());
+        Date expiration = extractExpiration(token);
+        return expiration != null && expiration.before(new Date());
     }
 
     private Date extractExpiration(String token) {
-        return extractClaim(token, Claims::getExpiration);
+        return extractClaim(token, JWTClaimsSet::getExpirationTime);
     }
 
-    private Claims extractAllClaims(String token) {
-        return Jwts
-                .parser()
-                .verifyWith(getSignInKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
+    private JWTClaimsSet extractAllClaims(String token) {
+        try {
+            // Phân tích cú pháp chuỗi JWT bằng Nimbus SignedJWT
+            SignedJWT signedJWT = SignedJWT.parse(token);
+
+            // Xác minh chữ ký bằng MACVerifier
+            JWSVerifier verifier = new MACVerifier(getSigningKeyBytes());
+            if (!signedJWT.verify(verifier)) {
+                throw new SignatureException("The JWT signature is invalid");
+            }
+
+            JWTClaimsSet claimsSet = signedJWT.getJWTClaimsSet();
+
+            // Kiểm tra token đã hết hạn hay chưa
+            if (claimsSet.getExpirationTime() != null && claimsSet.getExpirationTime().before(new Date())) {
+                throw new RuntimeException("The JWT token has expired");
+            }
+
+            return claimsSet;
+        } catch (ParseException e) {
+            throw new IllegalArgumentException("Invalid compact JWT string: " + e.getMessage(), e);
+        } catch (SignatureException e) {
+            throw new RuntimeException("The JWT signature is invalid", e);
+        } catch (JOSEException e) {
+            throw new RuntimeException("Nimbus JOSE exception: " + e.getMessage(), e);
+        }
     }
 
-    private SecretKey getSignInKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(keyBytes);
+    private byte[] getSigningKeyBytes() {
+        try {
+            return Base64.getDecoder().decode(secretKey);
+        } catch (IllegalArgumentException e) {
+            return secretKey.getBytes(StandardCharsets.UTF_8);
+        }
     }
 }
